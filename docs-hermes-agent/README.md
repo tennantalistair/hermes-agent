@@ -5,6 +5,9 @@ Organized documentation for Hermes Agent.
 ## Structure
 
 - **guides/** — How-to guides and tutorials
+  - `MEMORY_SYSTEM_GUIDE.md` — Persistent memory setup, configuration, and best practices
+  - `PROFILES_GUIDE.md` — Agent profiles, switching UI, and Paperclip integration
+  - `PROFILES_PAPERCLIP_INTEGRATION.md` — Detailed profile architecture and org chart mapping
   - `PROMPTING_GUIDE.md` — All ways to send prompts to Hermes (CLI, Python API, REST API)
   - `INTEGRATION_GUIDE_CLINE_TASKS.md` — Using Hermes via Cline tasks with examples
   - `CLINE_INTEGRATION_GUIDE.md` — Cline-specific integration patterns and workflow
