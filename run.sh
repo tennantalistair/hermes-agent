@@ -7,8 +7,8 @@ set -e
 cd "$(dirname "$0")"
 source venv/bin/activate
 
-# Default model
-MODEL="anthropic/claude-sonnet-4"
+# Default model (empty to use config default)
+MODEL=""
 TASK=""
 MAX_ITER="30"
 
@@ -43,9 +43,12 @@ if [ -z "$TASK" ]; then
     exit 1
 fi
 
-./hermes \
-  --model="$MODEL" \
-  --max-iterations="$MAX_ITER" \
-  --user-message="$TASK"
+# Build command
+CMD="./hermes chat --max-turns \"$MAX_ITER\" -q \"$TASK\""
+if [ -n "$MODEL" ]; then
+    CMD="$CMD -m \"$MODEL\""
+fi
+
+eval $CMD
 
 deactivate
