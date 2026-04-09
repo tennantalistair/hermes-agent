@@ -43,7 +43,7 @@ if [ -z "$TASK" ]; then
     exit 1
 fi
 
-hermes-agent \
+./hermes \
   --model="$MODEL" \
   --max-iterations="$MAX_ITER" \
   --user-message="$TASK"
