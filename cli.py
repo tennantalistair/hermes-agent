@@ -2949,6 +2949,11 @@ class HermesCLI:
         term_width = shutil.get_terminal_size().columns
         use_compact = self.compact or term_width < 80
         
+        # Get context length for display (needed outside if/else)
+        ctx_len = None
+        if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+            ctx_len = self.agent.context_compressor.context_length
+        
         if use_compact:
             self.console.print(_build_compact_banner())
             self._show_status()
@@ -2956,8 +2961,17 @@ class HermesCLI:
             # Get tools for display
             tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
             
+            if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                ctx_len = self.agent.context_compressor.context_length
+>>>>>>> 71a68bca (Update agent configuration and CLI)
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                ctx_len = self.agent.context_compressor.context_length
+=======
+            if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                ctx_len = self.agent.context_compressor.context_length
+>>>>>>> 71a68bca (Update agent configuration and CLI)
             
             # Build and display the banner
             build_welcome_banner(
