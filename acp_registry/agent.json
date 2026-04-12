@@ -6,7 +6,7 @@
   "icon": "icon.svg",
   "distribution": {
     "type": "command",
-    "command": "hermes",
+    "command": "/Users/_Hermes/paperclip-render/hermes_agent/venv/bin/hermes",
     "args": ["acp"]
   }
 }
