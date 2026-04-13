@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,6 +89,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS agent_api_keys (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    company_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    last_used_at REAL,
+    revoked_at REAL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS agent_api_keys_key_hash_idx ON agent_api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS agent_api_keys_company_agent_idx ON agent_api_keys(company_id, agent_id);
 """
 
 FTS_SQL = """
@@ -329,6 +344,27 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: add agent_api_keys table for Paperclip integration
+                # Stores API key hashes for agent authentication with one-way sync from Supabase
+                try:
+                    cursor.execute("""
+                        CREATE TABLE agent_api_keys (
+                            id TEXT PRIMARY KEY,
+                            agent_id TEXT NOT NULL,
+                            company_id TEXT NOT NULL,
+                            name TEXT NOT NULL,
+                            key_hash TEXT NOT NULL,
+                            last_used_at REAL,
+                            revoked_at REAL,
+                            created_at REAL NOT NULL
+                        )
+                    """)
+                    cursor.execute("CREATE INDEX IF NOT EXISTS agent_api_keys_key_hash_idx ON agent_api_keys(key_hash)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS agent_api_keys_company_agent_idx ON agent_api_keys(company_id, agent_id)")
+                except sqlite3.OperationalError:
+                    pass  # Table/index already exists
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -347,6 +383,13 @@ class SessionDB:
             cursor.executescript(FTS_SQL)
 
         self._conn.commit()
+
+    def close(self):
+        """Close the database connection."""
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
 
     # =========================================================================
     # Session lifecycle
@@ -517,6 +560,72 @@ class SessionDB:
                    (id, source, model, started_at)
                    VALUES (?, ?, ?, ?)""",
                 (session_id, source, model, time.time()),
+            )
+        self._execute_write(_do)
+
+    def set_token_counts(
+        self,
+        session_id: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        model: str = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        estimated_cost_usd: Optional[float] = None,
+        actual_cost_usd: Optional[float] = None,
+        cost_status: Optional[str] = None,
+        cost_source: Optional[str] = None,
+        pricing_version: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+    ) -> None:
+        """Set token counters to absolute values (not increment).
+
+        Use this when the caller provides cumulative totals from a completed
+        conversation run (e.g. the gateway, where the cached agent's
+        session_prompt_tokens already reflects the running total).
+        """
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   input_tokens = ?,
+                   output_tokens = ?,
+                   cache_read_tokens = ?,
+                   cache_write_tokens = ?,
+                   reasoning_tokens = ?,
+                   estimated_cost_usd = ?,
+                   actual_cost_usd = CASE
+                       WHEN ? IS NULL THEN actual_cost_usd
+                       ELSE ?
+                   END,
+                   cost_status = COALESCE(?, cost_status),
+                   cost_source = COALESCE(?, cost_source),
+                   pricing_version = COALESCE(?, pricing_version),
+                   billing_provider = COALESCE(billing_provider, ?),
+                   billing_base_url = COALESCE(billing_base_url, ?),
+                   billing_mode = COALESCE(billing_mode, ?),
+                   model = COALESCE(model, ?)
+                   WHERE id = ?""",
+                (
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    estimated_cost_usd,
+                    actual_cost_usd,
+                    actual_cost_usd,
+                    cost_status,
+                    cost_source,
+                    pricing_version,
+                    billing_provider,
+                    billing_base_url,
+                    billing_mode,
+                    model,
+                    session_id,
+                ),
             )
         self._execute_write(_do)
 
@@ -720,7 +829,6 @@ class SessionDB:
         exclude_sources: List[str] = None,
         limit: int = 20,
         offset: int = 0,
-        include_children: bool = False,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -729,15 +837,9 @@ class SessionDB:
         last_active (timestamp of last message).
 
         Uses a single query with correlated subqueries instead of N+2 queries.
-
-        By default, child sessions (subagent runs, compression continuations)
-        are excluded.  Pass ``include_children=True`` to include them.
         """
         where_clauses = []
         params = []
-
-        if not include_children:
-            where_clauses.append("s.parent_session_id IS NULL")
 
         if source:
             where_clauses.append("s.source = ?")
@@ -863,72 +965,150 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
-            )
-            rows = cursor.fetchall()
-        result = []
-        for row in rows:
-            msg = dict(row)
-            if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
-                    msg["tool_calls"] = []
-            result.append(msg)
-        return result
+    # =========================================================================
+    # Agent API Keys (Paperclip Integration)
+    # =========================================================================
 
-    def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
+    def sync_api_key_from_supabase(
+        self,
+        id: str,
+        agent_id: str,
+        company_id: str,
+        name: str,
+        key_hash: str,
+        created_at: float,
+        last_used_at: Optional[float] = None,
+        revoked_at: Optional[float] = None,
+    ) -> None:
+        """Sync an API key record from Supabase (one-way sync).
+
+        Creates or updates the API key record with data from Supabase.
+        Used for one-way synchronization where Supabase is the authoritative source.
         """
-        Load messages in the OpenAI conversation format (role + content dicts).
-        Used by the gateway to restore conversation history.
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO agent_api_keys
+                   (id, agent_id, company_id, name, key_hash, last_used_at, revoked_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id, agent_id, company_id, name, key_hash, last_used_at, revoked_at, created_at),
+            )
+        self._execute_write(_do)
+
+    def validate_api_key_hash(self, key_hash: str) -> Optional[Dict[str, Any]]:
+        """Validate an API key by its hash.
+
+        Returns the API key record if valid and not revoked, None otherwise.
+        Also updates the last_used_at timestamp for successful validations.
         """
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "reasoning, reasoning_details, codex_reasoning_items "
-                "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
-                (session_id,),
+                "SELECT * FROM agent_api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+                (key_hash,),
             )
-            rows = cursor.fetchall()
-        messages = []
-        for row in rows:
-            msg = {"role": row["role"], "content": row["content"]}
-            if row["tool_call_id"]:
-                msg["tool_call_id"] = row["tool_call_id"]
-            if row["tool_name"]:
-                msg["tool_name"] = row["tool_name"]
-            if row["tool_calls"]:
-                try:
-                    msg["tool_calls"] = json.loads(row["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
-                    msg["tool_calls"] = []
-            # Restore reasoning fields on assistant messages so providers
-            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
-            # coherent multi-turn reasoning context.
-            if row["role"] == "assistant":
-                if row["reasoning"]:
-                    msg["reasoning"] = row["reasoning"]
-                if row["reasoning_details"]:
-                    try:
-                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
-                        msg["reasoning_details"] = None
-                if row["codex_reasoning_items"]:
-                    try:
-                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
-                        msg["codex_reasoning_items"] = None
-            messages.append(msg)
-        return messages
+            row = cursor.fetchone()
+
+        if row:
+            # Update last_used_at timestamp
+            key_record = dict(row)
+            def _do(conn):
+                conn.execute(
+                    "UPDATE agent_api_keys SET last_used_at = ? WHERE id = ?",
+                    (time.time(), key_record["id"]),
+                )
+            self._execute_write(_do)
+            return key_record
+        return None
+
+    def get_api_key_by_hash(self, key_hash: str) -> Optional[Dict[str, Any]]:
+        """Get API key record by hash (without updating last_used_at)."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM agent_api_keys WHERE key_hash = ?", (key_hash,)
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def revoke_api_key(self, key_id: str) -> bool:
+        """Revoke an API key by setting revoked_at timestamp.
+
+        Returns True if the key was found and revoked, False otherwise.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE agent_api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (time.time(), key_id),
+            )
+            return cursor.rowcount > 0
+        return self._execute_write(_do)
+
+    def list_api_keys(
+        self,
+        agent_id: str = None,
+        company_id: str = None,
+        include_revoked: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List API keys with optional filtering."""
+        where_clauses = []
+        params = []
+
+        if agent_id:
+            where_clauses.append("agent_id = ?")
+            params.append(agent_id)
+
+        if company_id:
+            where_clauses.append("company_id = ?")
+            params.append(company_id)
+
+        if not include_revoked:
+            where_clauses.append("revoked_at IS NULL")
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        sql = f"""
+            SELECT * FROM agent_api_keys
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_api_keys_for_agent(self, agent_id: str) -> List[Dict[str, Any]]:
+        """Get all active API keys for a specific agent."""
+        return self.list_api_keys(agent_id=agent_id, include_revoked=False)
+
+    def get_api_keys_for_company(self, company_id: str) -> List[Dict[str, Any]]:
+        """Get all active API keys for a specific company."""
+        return self.list_api_keys(company_id=company_id, include_revoked=False)
+
+    def cleanup_revoked_keys(self, older_than_days: int = 90) -> int:
+        """Delete revoked API keys older than N days.
+
+        Returns the number of keys deleted.
+        """
+        cutoff = time.time() - (older_than_days * 86400)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM agent_api_keys WHERE revoked_at IS NOT NULL AND revoked_at < ?",
+                (cutoff,),
+            )
+            count = cursor.fetchone()[0]
+
+            conn.execute(
+                "DELETE FROM agent_api_keys WHERE revoked_at IS NOT NULL AND revoked_at < ?",
+                (cutoff,),
+            )
+            return count
+
+        return self._execute_write(_do)
+
+
 
     # =========================================================================
     # Search
@@ -946,9 +1126,8 @@ class SessionDB:
         Strategy:
         - Preserve properly paired quoted phrases (``"exact phrase"``)
         - Strip unmatched FTS5-special characters that would cause errors
-        - Wrap unquoted hyphenated and dotted terms in quotes so FTS5
-          matches them as exact phrases instead of splitting on the
-          hyphen/dot (e.g. ``chat-send``, ``P2.2``, ``my-app.config.ts``)
+        - Wrap unquoted hyphenated terms in quotes so FTS5 matches them
+          as exact phrases instead of splitting on the hyphen
         """
         # Step 1: Extract balanced double-quoted phrases and protect them
         # from further processing via numbered placeholders.
@@ -973,13 +1152,11 @@ class SessionDB:
         sanitized = re.sub(r"(?i)^(AND|OR|NOT)\b\s*", "", sanitized.strip())
         sanitized = re.sub(r"(?i)\s+(AND|OR|NOT)\s*$", "", sanitized.strip())
 
-        # Step 5: Wrap unquoted dotted and/or hyphenated terms in double
-        # quotes.  FTS5's tokenizer splits on dots and hyphens, turning
-        # ``chat-send`` into ``chat AND send`` and ``P2.2`` into ``p2 AND 2``.
-        # Quoting preserves phrase semantics.  A single pass avoids the
-        # double-quoting bug that would occur if dotted and hyphenated
-        # patterns were applied sequentially (e.g. ``my-app.config``).
-        sanitized = re.sub(r"\b(\w+(?:[.-]\w+)+)\b", r'"\1"', sanitized)
+        # Step 5: Wrap unquoted hyphenated terms (e.g. ``chat-send``) in
+        # double quotes.  FTS5's tokenizer splits on hyphens, turning
+        # ``chat-send`` into ``chat AND send``.  Quoting preserves the
+        # intended phrase match.
+        sanitized = re.sub(r"\b(\w+(?:-\w+)+)\b", r'"\1"', sanitized)
 
         # Step 6: Restore preserved quoted phrases
         for i, quoted in enumerate(_quoted_parts):
@@ -1173,35 +1350,22 @@ class SessionDB:
         self._execute_write(_do)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and all its messages.
-
-        Child sessions are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted, so they remain accessible independently.
-        Returns True if the session was found and deleted.
-        """
+        """Delete a session and all its messages. Returns True if found."""
         def _do(conn):
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
             )
             if cursor.fetchone()[0] == 0:
                 return False
-            # Orphan child sessions so FK constraint is satisfied
-            conn.execute(
-                "UPDATE sessions SET parent_session_id = NULL "
-                "WHERE parent_session_id = ?",
-                (session_id,),
-            )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
         return self._execute_write(_do)
 
     def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
-        """Delete sessions older than N days. Returns count of deleted sessions.
-
-        Only prunes ended sessions (not active ones).  Child sessions outside
-        the prune window are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted.
+        """
+        Delete sessions older than N days. Returns count of deleted sessions.
+        Only prunes ended sessions (not active ones).
         """
         cutoff = time.time() - (older_than_days * 86400)
 
@@ -1217,18 +1381,7 @@ class SessionDB:
                     "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
                     (cutoff,),
                 )
-            session_ids = set(row["id"] for row in cursor.fetchall())
-
-            if not session_ids:
-                return 0
-
-            # Orphan any sessions whose parent is about to be deleted
-            placeholders = ",".join("?" * len(session_ids))
-            conn.execute(
-                f"UPDATE sessions SET parent_session_id = NULL "
-                f"WHERE parent_session_id IN ({placeholders})",
-                list(session_ids),
-            )
+            session_ids = [row["id"] for row in cursor.fetchall()]
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
