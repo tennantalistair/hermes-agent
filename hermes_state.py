@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS agent_api_keys (
     company_id TEXT NOT NULL,
     name TEXT NOT NULL,
     key_hash TEXT NOT NULL,
+    key_plaintext TEXT,  -- ⚠️  PLAIN-TEXT API KEY STORAGE (SECURITY RISK)
     last_used_at REAL,
     revoked_at REAL,
     created_at REAL NOT NULL
@@ -355,6 +356,7 @@ class SessionDB:
                             company_id TEXT NOT NULL,
                             name TEXT NOT NULL,
                             key_hash TEXT NOT NULL,
+                            key_plaintext TEXT,  -- ⚠️  PLAIN-TEXT API KEY STORAGE (SECURITY RISK)
                             last_used_at REAL,
                             revoked_at REAL,
                             created_at REAL NOT NULL
@@ -365,6 +367,13 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Table/index already exists
                 cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                # v8: add key_plaintext column for plain-text key storage (SECURITY RISK)
+                try:
+                    cursor.execute("ALTER TABLE agent_api_keys ADD COLUMN key_plaintext TEXT")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -993,6 +1002,63 @@ class SessionDB:
                 (id, agent_id, company_id, name, key_hash, last_used_at, revoked_at, created_at),
             )
         self._execute_write(_do)
+
+    def sync_api_key_plaintext_from_supabase(
+        self,
+        id: str,
+        agent_id: str,
+        company_id: str,
+        name: str,
+        key_plaintext: str,
+        key_hash: str,
+        created_at: float,
+        last_used_at: Optional[float] = None,
+        revoked_at: Optional[float] = None,
+    ) -> None:
+        """Sync an API key record from Supabase with PLAIN-TEXT key storage.
+
+        ⚠️  SECURITY WARNING: This stores plain-text API keys locally!
+        Only use on trusted devices with proper access controls.
+
+        Creates or updates the API key record with both hash and plain-text key.
+        Used for devices that cannot perform hash-based authentication.
+        """
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO agent_api_keys
+                   (id, agent_id, company_id, name, key_hash, key_plaintext, last_used_at, revoked_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (id, agent_id, company_id, name, key_hash, key_plaintext, last_used_at, revoked_at, created_at),
+            )
+        self._execute_write(_do)
+
+    def validate_api_key_plaintext(self, provided_key: str) -> Optional[Dict[str, Any]]:
+        """Validate an API key by comparing plain-text keys.
+
+        ⚠️  SECURITY WARNING: This compares against stored plain-text keys!
+        Only use on trusted devices where plain-text storage is necessary.
+
+        Returns the API key record if valid and not revoked, None otherwise.
+        Also updates the last_used_at timestamp for successful validations.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM agent_api_keys WHERE key_plaintext = ? AND revoked_at IS NULL",
+                (provided_key,),
+            )
+            row = cursor.fetchone()
+
+        if row:
+            # Update last_used_at timestamp
+            key_record = dict(row)
+            def _do(conn):
+                conn.execute(
+                    "UPDATE agent_api_keys SET last_used_at = ? WHERE id = ?",
+                    (time.time(), key_record["id"]),
+                )
+            self._execute_write(_do)
+            return key_record
+        return None
 
     def validate_api_key_hash(self, key_hash: str) -> Optional[Dict[str, Any]]:
         """Validate an API key by its hash.

@@ -97,7 +97,7 @@ def sync_api_keys_from_supabase(db: SessionDB, supabase: Client) -> Dict[str, in
                     'agent_id': key_data['agent_id'],
                     'company_id': key_data['company_id'],
                     'name': key_data['name'],
-                    'key_hash': key_data['key_hash'],
+                    'key_hash': key_data['api_key'],  # api_key column contains the actual key
                     'created_at': parse_timestamp(key_data['created_at']),
                     'last_used_at': parse_timestamp(key_data['last_used_at']),
                     'revoked_at': parse_timestamp(key_data['revoked_at']),
