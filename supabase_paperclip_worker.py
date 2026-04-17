@@ -99,6 +99,22 @@ def _get_data(res) -> List[Dict[str, Any]]:
 # Paperclip data access — unified multi-agent
 # =============================================================================
 
+def _fetch_agent_models(supabase, agent_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Fetch agent_models rows for given agent IDs. Returns dict keyed by agent_id."""
+    if not agent_ids:
+        return {}
+    res = (
+        supabase.table("agent_models")
+        .select("agent_id, model_id, temperature, max_tokens")
+        .in_("agent_id", agent_ids)
+        .eq("is_active", True)
+        .eq("assignment_type", "primary")
+        .execute()
+    )
+    rows = _get_data(res)
+    return {r["agent_id"]: r for r in rows}
+
+
 def _select_next_runs(supabase) -> List[Dict[str, Any]]:
     """
     Fetch ALL queued runs for Hermes-type agents.
@@ -119,6 +135,9 @@ def _select_next_runs(supabase) -> List[Dict[str, Any]]:
     hermes_agent_ids = [a["id"] for a in agents_rows]
     agent_map = {a["id"]: a for a in agents_rows}
 
+    # Fetch agent_models for model/temperature/max_tokens config
+    agent_models_map = _fetch_agent_models(supabase, hermes_agent_ids)
+
     # Fetch queued runs for these agents
     res = (
         supabase.table("heartbeat_runs")
@@ -131,10 +150,21 @@ def _select_next_runs(supabase) -> List[Dict[str, Any]]:
     )
     runs = _get_data(res)
 
-    # Attach agent info to each run
+    # Attach agent info + agent_models config to each run
     for run in runs:
         agent = agent_map.get(run.get("agent_id"), {})
         run["_agent"] = agent
+
+        # Merge agent_models (model_id → model, preserve runtime_config as fallback)
+        model_row = agent_models_map.get(agent.get("id"), {})
+        runtime_cfg = dict(agent.get("runtime_config") or {})
+        if model_row.get("model_id"):
+            runtime_cfg["model"] = model_row["model_id"]
+        if model_row.get("temperature") is not None:
+            runtime_cfg["temperature"] = float(model_row["temperature"])
+        if model_row.get("max_tokens") is not None:
+            runtime_cfg["max_tokens"] = int(model_row["max_tokens"])
+        run["_runtime_config"] = runtime_cfg
 
     return runs
 
@@ -211,6 +241,9 @@ def _fetch_issue_context(supabase, run: Dict[str, Any]) -> Dict[str, Any]:
         if comp_rows:
             company_name = comp_rows[0].get("name")
 
+    # Prefer merged agent_models config, fall back to runtime_config
+    runtime_config = run.get("_runtime_config") or agent.get("runtime_config") or {}
+
     return {
         "issue_id": issue["id"],
         "issue_title": issue.get("title", ""),
@@ -224,7 +257,7 @@ def _fetch_issue_context(supabase, run: Dict[str, Any]) -> Dict[str, Any]:
         "agent_id": run.get("agent_id"),
         "agent_role": agent.get("role"),
         "agent_name": agent.get("name"),
-        "agent_runtime_config": agent.get("runtime_config") or {},
+        "agent_runtime_config": runtime_config,
         "agent_capabilities": agent.get("capabilities"),
         "heartbeat_run_id": run_id,
         "run_context": run.get("context_snapshot") or {},
@@ -382,6 +415,11 @@ def _run_hermes_agent(
     env = {**os.environ}
     if api_key:
         env["OPENROUTER_API_KEY"] = api_key
+
+    # max_tokens from agent_models → HERMES_MAX_TOKENS env var for LLM API
+    max_tokens = runtime_config.get("max_tokens")
+    if max_tokens:
+        env["HERMES_MAX_TOKENS"] = str(max_tokens)
 
     logger.info(
         "Running Hermes (model=%s, turns=%d, agent_role=%s) in %s",
